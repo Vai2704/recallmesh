@@ -56,7 +56,6 @@ if st.session_state.get("active_tenant") != tenant or st.session_state.get("acti
     st.session_state.session_id = f"session_{uuid.uuid4().hex[:12]}"
     st.session_state.messages = []
     st.session_state.pop("last_task_id", None)
-    st.session_state.pop("last_answer", None)
 if "session_id" not in st.session_state:
     st.session_state.session_id = f"session_{uuid.uuid4().hex[:12]}"
 if "messages" not in st.session_state:
@@ -103,7 +102,6 @@ def render_chat():
             st.session_state.session_id = f"session_{uuid.uuid4().hex[:12]}"
             st.session_state.messages = []
             st.session_state.session_select = st.session_state.session_id
-            st.session_state.pop("last_answer", None)
             st.rerun()
 
     labels = [item["session_id"] for item in sessions]
@@ -116,7 +114,6 @@ def render_chat():
         if selected != st.session_state.session_id:
             st.session_state.session_id = selected
             st.session_state.messages = session_messages(selected)
-            st.session_state.pop("last_answer", None)
             st.rerun()
     if not st.session_state.messages:
         st.session_state.messages = session_messages(st.session_state.session_id)
@@ -129,30 +126,10 @@ def render_chat():
     if prompt:
         result = DeterministicChatAgent(store).handle(tenant, user, st.session_state.session_id, prompt)
         st.session_state.last_task_id = result.coordination["task_id"] if result.coordination else None
-        st.session_state.last_answer = {
-            "memories": result.retrieved_memories,
-            "provenance": result.provenance,
-            "routed_to": (result.coordination or {}).get("routed_to"),
-            "route_reason": (result.coordination or {}).get("route_reason"),
-        }
         st.session_state.messages.extend(
             [{"role": "user", "content": prompt}, {"role": "assistant", "content": result.response}]
         )
         st.rerun()
-
-    answer = st.session_state.get("last_answer") or {}
-    memories = answer.get("memories") or []
-    provenance = answer.get("provenance") or []
-    if memories:
-        st.markdown("**Sources**")
-        if answer.get("routed_to"):
-            st.caption(f"Answered by {answer['routed_to'].replace('_', ' ')}")
-        for item in memories:
-            st.markdown(f"**{item['memory_type'].title()}** · {item['scope']}  \n{item['content']}")
-        hops = [line for row in provenance for line in (row.get("hops") or [])]
-        if hops:
-            with st.expander("How this was found"):
-                st.code("\n".join(hops), language="text")
 
     with st.expander("Activity"):
         st.dataframe(store.get_recent_turns(tenant, user, 20), use_container_width=True, hide_index=True)

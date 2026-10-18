@@ -72,6 +72,41 @@ class GraphStore:
         stripped = str(text or "").strip()
         return stripped.endswith("?") or bool(QUESTION_PREFIX.match(stripped))
 
+    @staticmethod
+    def asked_subjects(text: str) -> list[str]:
+        """Subjects named in a question, such as 'name' or 'preferred stack'."""
+        subjects = []
+        for match in re.finditer(r"\b(?:my|our)\s+([a-z][a-z ]{1,40})", str(text or ""), re.I):
+            phrase = re.split(r"\b(?:and|or)\b|,", match.group(1), maxsplit=1, flags=re.I)[0]
+            lowered = phrase.strip(" ?.!").lower()
+            if lowered and lowered not in subjects:
+                subjects.append(lowered)
+        return subjects
+
+    @staticmethod
+    def matching_clauses(content: str, subjects: list[str]) -> list[str]:
+        """Keep only the clauses that answer the subjects that were asked."""
+        text = str(content or "").strip()
+        if not text:
+            return []
+        clauses = []
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+            for part in re.split(r",\s*(?:and\s+)?(?=my\s+)|\s+and\s+(?=my\s+)", sentence, flags=re.I):
+                clause = part.strip(" ,")
+                if clause:
+                    clauses.append(clause)
+        if not subjects:
+            return [text]
+        kept = []
+        for clause in clauses:
+            bag = GraphStore.tokens(clause)
+            if any(GraphStore.tokens(subject) <= bag for subject in subjects if GraphStore.tokens(subject)):
+                spoken = clause if clause.endswith((".", "!", "?")) else f"{clause}."
+                spoken = spoken[0].upper() + spoken[1:] if spoken else spoken
+                if spoken not in kept:
+                    kept.append(spoken)
+        return kept
+
     def create_session(self, tenant_id, session_id, user_id, created_at=None):
         query = """MERGE (s:Session {session_id:$session_id})
         ON CREATE SET s.user_id=$user_id, s.created_at=$created_at
@@ -150,6 +185,37 @@ class GraphStore:
             unique.append(item)
         return sorted(unique, key=lambda item: (item["relevance"], item.get("confidence") or 0, item.get("updated_at") or ""), reverse=True)
 
+    def _focus_hits(self, text, hits):
+        """Drop memories that do not answer the subject that was asked."""
+        if not hits:
+            return []
+        subjects = self.asked_subjects(text)
+        if not subjects:
+            top = max(item.get("relevance") or 0 for item in hits)
+            return [item for item in hits if (item.get("relevance") or 0) == top][:3]
+        subject_terms = set()
+        for subject in subjects:
+            subject_terms |= self.tokens(subject)
+        extra = self.tokens(text) - subject_terms - {
+            "which", "checks", "required", "before", "using", "saved", "prepare", "checklist",
+        }
+        focused = []
+        for item in hits:
+            bag = self.tokens(item.get("content")) | self.tokens(str(item.get("fact_key") or "").replace("_", " "))
+            if self._covers_subject(bag, subjects) or (extra & bag):
+                focused.append(item)
+        return focused
+
+    @staticmethod
+    def _covers_subject(bag: set[str], subjects: list[str]) -> bool:
+        optional = {"process", "procedure", "detail", "details", "info", "information"}
+        for subject in subjects:
+            terms = GraphStore.tokens(subject)
+            required = terms - optional or terms
+            if required and required <= bag:
+                return True
+        return False
+
     def retrieve_relevant_memory(self, tenant_id, user_id, text, limit=10, exclude_contents=None):
         query = """MATCH (m:Memory) WHERE m.active=true AND (m.scope='shared' OR m.user_id=$user_id)
         RETURN m.memory_id AS memory_id, m.user_id AS user_id, m.scope AS scope,
@@ -161,7 +227,7 @@ class GraphStore:
         excluded = {str(item).strip().lower() for item in (exclude_contents or []) if item}
         if not self.tokens(text):
             return []
-        memory_hits = self._latest_facts(self._score_candidates(memories, text, excluded))
+        memory_hits = self._focus_hits(text, self._latest_facts(self._score_candidates(memories, text, excluded)))
         if memory_hits:
             return memory_hits[:limit]
         turns = []
@@ -181,7 +247,7 @@ class GraphStore:
                 "fact_key": None,
                 "source": "turn",
             })
-        turn_hits = self._score_candidates(turns, text, excluded)
+        turn_hits = self._focus_hits(text, self._score_candidates(turns, text, excluded))
         return sorted(turn_hits, key=lambda item: (item["relevance"], item.get("updated_at") or ""), reverse=True)[:1]
 
     def retrieve_shared_memory(self, tenant_id, user_id, memory_type=None, limit=50):

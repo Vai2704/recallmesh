@@ -1,6 +1,8 @@
 import uuid
 from dataclasses import dataclass, field
 
+from memory.graph_store import GraphStore
+
 from .coordinator import CoordinatorAgent
 from .memory_agent import MemoryAgent
 from .routing import should_coordinate
@@ -57,21 +59,11 @@ class DeterministicChatAgent:
     @staticmethod
     def _compose(text, retrieved, saved, coordination) -> str:
         if coordination and coordination.get("result"):
-            reason = coordination.get("route_reason") or ""
-            suffix = f"\n\n{reason}" if reason else ""
-            return f"{coordination['result']}{suffix}"
+            return coordination["result"]
+        if not GraphStore.is_question(text):
+            return "Saved."
         if retrieved:
-            evidence = "\n".join(
-                f"- {item['memory_type']} `{item['memory_id']}`: {item['content']}"
-                for item in retrieved[:3]
-            )
-            return f"From persisted FalkorDB memory:\n{evidence}"
-        if saved:
-            stored = "\n".join(
-                f"- {item['memory_type']} `{item['memory_id']}`: {item['content']}"
-                for item in saved[:3]
-            )
-            return f"Stored in FalkorDB. This will be available in later sessions.\n{stored}"
+            return MemoryAgent.format_recall(text, retrieved)
         if "preferred stack" in text.lower():
             return "I do not have a persisted preferred stack for you yet."
         if "release" in text.lower() or "process" in text.lower():

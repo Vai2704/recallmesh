@@ -1,6 +1,10 @@
 import re
 import uuid
 
+from memory.graph_store import GraphStore
+
+_FACT_VALUE = r"(.+?)(?=(?:,\s*(?:and\s+)?my\s+)|\s+and\s+my\s+|\.|$)"
+
 
 class MemoryAgent:
     """Reads and writes episodic, semantic, and procedural memory in FalkorDB."""
@@ -20,14 +24,14 @@ class MemoryAgent:
     @staticmethod
     def classify(text: str) -> list[tuple[str, str, str]]:
         memories = []
-        name = re.search(r"my\s+name\s+is\s+(.+?)(?:\.|$)", text, re.I)
+        name = re.search(rf"my\s+name\s+is\s+{_FACT_VALUE}", text, re.I)
         if name:
             memories.append(("semantic", "name", f"My name is {name.group(1).strip()}."))
-        match = re.search(r"my\s+preferred\s+([a-z ]+?)\s+is\s+(.+?)(?:\.|$)", text, re.I)
+        match = re.search(rf"my\s+preferred\s+([a-z ]+?)\s+is\s+{_FACT_VALUE}", text, re.I)
         if match:
             key = f"preferred_{re.sub(r'[^a-z0-9]+', '_', match.group(1).strip().lower()).strip('_')}"
             memories.append(("semantic", key, f"My preferred {match.group(1).strip()} is {match.group(2).strip()}."))
-        for generic in re.finditer(r"my\s+([a-z][a-z ]{1,30})\s+is\s+(.+?)(?:\.|$)", text, re.I):
+        for generic in re.finditer(r"my\s+([a-z][a-z ]{1,30})\s+is\s+" + _FACT_VALUE, text, re.I):
             subject_raw = generic.group(1).strip().lower()
             if subject_raw == "name" or subject_raw.startswith("preferred"):
                 continue
@@ -67,17 +71,27 @@ class MemoryAgent:
             ))
         return saved, superseded
 
+    @staticmethod
+    def format_recall(request: str, memories: list[dict]) -> str:
+        """Answer with the requested fact only, without memory ids or extra details."""
+        subjects = GraphStore.asked_subjects(request)
+        lines = []
+        seen = set()
+        for item in memories:
+            for clause in GraphStore.matching_clauses(item.get("content") or "", subjects):
+                key = clause.strip().lower()
+                if key not in seen:
+                    seen.add(key)
+                    lines.append(clause)
+        if lines:
+            return "\n".join(lines)
+        return "I don't have that saved yet."
+
     def execute(self, tenant_id, task_id, handoff_id, request, user_id=None):
         """Complete a recall handoff using memories already linked to the task."""
         self.store.update_handoff(tenant_id, handoff_id, "in_progress")
         memories = [item for item in self.store.get_task_memories(tenant_id, task_id) if item.get("memory_id")]
-        if memories:
-            lines = ["Memory Agent recalled active FalkorDB facts:"]
-            for item in memories[:5]:
-                lines.append(f"- {item['memory_type']} `{item['memory_id']}`: {item['content']}")
-            result = "\n".join(lines)
-        else:
-            result = "Memory Agent found no matching active memory in this tenant graph."
+        result = self.format_recall(request, memories) if memories else "I don't have that saved yet."
         if user_id:
             self.store.upsert_shared_state(tenant_id, user_id, "last_agent_result", result, self.name, task_id)
         self.store.update_handoff(tenant_id, handoff_id, "completed", result=result)
