@@ -31,4 +31,10 @@ def test_coordinator_persists_task_handoff_assignment_and_completion(store):
     assert handoff.result_set[0][0] == "completed"
     assert memory_id in handoff.result_set[0][1]
     assert assignment.result_set == [["workflow_specialist"]]
+    assert result["routed_to"] == "workflow_specialist"
+    assert "Checklist" in result["result"]
+    assert "Release means test, build, QA" in result["result"]
+    shared = store.get_shared_state(tenant, "alice", "last_specialist_result")
+    assert shared and "Checklist" in shared[0]["value"]
+    assert store.get_shared_state(tenant, "bob") == []
     assert any(event["event_type"] == "handoff" for event in store.coordination_timeline(tenant, result["task_id"]))

@@ -15,7 +15,7 @@ def test_final_demo_sequence_uses_two_memory_types_and_session_links():
     assert {item["memory_type"] for item in first.saved_memory} == {"semantic", "procedural"}
     second_session = f"session_{uuid.uuid4().hex[:10]}"
     recalled = agent.handle(tenant, "maya", second_session, "What is my preferred stack, and which checks are required before release?")
-    assert {item["memory_type"] for item in recalled.retrieved_memories} == {"semantic", "procedural"}
+    assert {"semantic", "procedural"} <= {item["memory_type"] for item in recalled.retrieved_memories}
     linked = store.query(tenant, "MATCH (s:Session {session_id:$session_id})-[:HAS_MEMORY]->(m:Memory) RETURN count(m) AS count", {"session_id": second_session})
     assert linked.result_set == [[2]]
     coordinated = agent.handle(tenant, "maya", second_session, "Prepare a release checklist using our saved procedure.")

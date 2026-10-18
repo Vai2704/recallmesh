@@ -1,142 +1,359 @@
 # RecallMesh
 
-RecallMesh is a hackathon MVP for the **Agent Memory and Coordination** track. It gives multiple deterministic agents durable, tenant-isolated memory and observable handoffs using FalkorDB as the source of truth.
+RecallMesh is a workspace for **agent memory**. People chat with it like a normal assistant, but what they say is stored in a **FalkorDB graph**, not in the browser window.
 
-## Problem and solution
+Close the chat, start a new session, or hand work to another agent — the facts are still there. Each organization gets its own graph. Each person has their own personal memory.
 
-AI agents lose useful context between conversations, cannot reliably share tenant knowledge, and often hide delegation inside application state. RecallMesh persists sessions, turns, memories, tasks, handoffs, results, status events, and relationships in FalkorDB. A coordinator retrieves graph context, creates a task and handoff, routes work to a workflow specialist, and records the result. The UI shows the evidence and timeline.
+No API key is required. Answers are deterministic and grounded in graph records.
 
-## Architecture
+---
+
+## The problem
+
+Typical agents forget. Context lives in the current chat, in RAM, or inside one process.
+
+That fails in three common ways:
+
+1. **A new session starts empty**, even if the same person already shared facts.
+2. **A second agent cannot see** what the first one learned.
+3. **You cannot explain an answer** — there is no durable trail of which fact was used, or that an older fact was replaced.
+
+---
+
+## How RecallMesh solves it
+
+Everything durable is a node or edge in FalkorDB.
+
+| You do this | What happens |
+|---|---|
+| Tell it a fact (`My favorite food is Dosa.`) | A **Memory** node is written. The chat turn is linked to a **Session**. |
+| Click **New chat** and ask the fact back | The Memory Agent **queries the graph**, not the old screen. Session 12’s messages are not copied into session 5. |
+| Change the fact later | A new Memory is created. The old one stays, marked inactive, with a `SUPERSEDES` edge. Only the latest is used. |
+| Ask about a process or checklist | The coordinator **routes from graph memory** to the Workflow Specialist. That agent reads the procedural node and returns steps. |
+| Open **Sources** or **Agents** | You see which nodes and relationships produced the answer. |
+
+Three kinds of memory:
+
+- **Semantic** — durable facts (“my name is…”, “my preferred stack is…”).
+- **Procedural** — how work is done (“our release process requires…”).
+- **Episodic** — other statements kept as experience.
+
+Personal memories match the signed-in user. Shared memories are visible to everyone in that organization. Acme and Beta are separate graphs (`recallmesh_acme-demo`, `recallmesh_beta-demo`).
+
+---
+
+## How the graph is used
 
 ```text
-Streamlit UI
-  ├── Chat & Recall ─┐
-  ├── Memory Explorer │
-  ├── Agent Coordination ── Deterministic agents
-  ├── Graph View      │         ├── Coordinator
-  ├── Isolation/Test  │         ├── Memory Agent
-  └── System Health ──┘         └── Workflow Specialist
-                             │
-                      GraphStore repository
-                             │ official falkordb client
-                             ▼
-              FalkorDB graph per tenant/workspace
+UI (Chat, Memory, Agents, Graph)
+        │
+        ▼
+Coordinator
+   ├── Memory Agent          (recall questions)
+   └── Workflow Specialist   (procedures / checklists)
+        │
+        ▼
+GraphStore  →  official FalkorDB client
+        │
+        ▼
+One graph per organization
 ```
 
-No SQLite, local file, or Python dictionary is used as durable application state.
-
-## Memory behavior
-
-- **Episodic**: events and conversation experiences.
-- **Semantic**: durable facts, preferences, and learned knowledge; fact updates create an inactive prior version and a `SUPERSEDES` edge.
-- **Procedural**: instructions, workflows, and ways to complete tasks.
-
-Personal memories require the matching `user_id`. Shared memories are visible only inside the current tenant graph. Tenant graphs are selected as `recallmesh_<validated-tenant>`.
-
-## Graph data model
+Relationships:
 
 ```text
 (Session)-[:HAS_TURN]->(Turn)
 (Session)-[:HAS_MEMORY]->(Memory)
 (Memory)-[:SUPERSEDES]->(Memory)
 (Task)-[:ASSIGNED_TO]->(Agent)
-(Task)-[:HAS_HANDOFF]->(Handoff)-[:FROM_AGENT]->(Agent)
+(Task)-[:HAS_HANDOFF]->(Handoff)
+(Handoff)-[:FROM_AGENT]->(Agent)
 (Handoff)-[:TO_AGENT]->(Agent)
 (Task)-[:USES_MEMORY]->(Memory)
+(Task)-[:USES_STATE]->(SharedState)
 (Task)-[:HAS_EVENT]->(CoordinationEvent)
 ```
 
-Nodes include `Session`, `Turn`, `Memory`, `Agent`, `Task`, `Handoff`, and `CoordinationEvent`. Task and handoff statuses are `pending`, `in_progress`, `completed`, or `failed`, with timestamps and results/errors.
+Queries live in `memory/graph_store.py`. Examples are in `queries.cypher`. Application state is not kept in SQLite, files, or Python dicts.
 
-## Prerequisites and exact startup
+---
 
-Requirements: Python 3.11+, Docker, and a running FalkorDB container.
+## What you need
+
+- **Python 3.11+**
+- **Docker** (for FalkorDB)
+- Git, to clone the repo
+
+---
+
+## Run it locally
+
+### 1. Clone and enter the project
 
 ```bash
-cd /home/Anurag/hackathon
-python3.11 -m venv .venv
+git clone https://github.com/Vai2704/recallmesh.git
+cd recallmesh
+```
+
+### 2. Create a virtual environment and install packages
+
+**macOS / Linux**
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+```
+
+**Windows (PowerShell)**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+If PowerShell blocks activation, run:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Then activate again.
+
+### 3. Environment file
+
+**macOS / Linux**
+
+```bash
 cp .env.example .env
+```
+
+**Windows**
+
+```powershell
+copy .env.example .env
+```
+
+Defaults talk to FalkorDB on `localhost:6379`. You do not need an LLM key.
+
+### 4. Start FalkorDB
+
+```bash
 docker run -d --name recallmesh-db -p 6379:6379 falkordb/falkordb:latest
+```
+
+If that container already exists:
+
+```bash
+docker start recallmesh-db
+```
+
+Or with Compose (database only):
+
+```bash
+docker compose up -d falkordb
+```
+
+Check it is up:
+
+```bash
+docker ps
+```
+
+You should see `recallmesh-db` (or `falkordb`) listening on port **6379**.
+
+### 5. Load sample data (optional but useful)
+
+```bash
 python scripts/seed_demo.py --reset
+```
+
+This only resets the **Acme** graph, then seeds a few demo memories. Run it again without `--reset` if you only want to refresh those fixed IDs. **Beta is not touched.**
+
+### 6. Start the app
+
+```bash
 streamlit run app.py
 ```
 
-If the container already exists, use `docker start recallmesh-db`. With Compose instead: `docker compose up -d falkordb`.
+Open the URL Streamlit prints, usually [http://localhost:8501](http://localhost:8501).
 
-The exact application command is `streamlit run app.py`.
+Leave this terminal running. Use another terminal (with the venv activated) for tests or seed commands.
 
-## Configuration
+---
 
-`.env.example` defines `FALKORDB_HOST`, `FALKORDB_PORT`, optional `FALKORDB_USERNAME`, optional `FALKORDB_PASSWORD`, `FALKORDB_GRAPH_PREFIX`, and optional `LLM_API_KEY` or `OPENAI_API_KEY`. The current response path is deterministic and needs no API key. FalkorDB connectivity errors are shown in the UI and the seed command exits non-zero instead of pretending to persist.
+## How to use
 
-## Demo flow
+After `streamlit run app.py`, open [http://localhost:8501](http://localhost:8501).
 
-1. Open **Chat & Recall** in workspace `acme-demo`, user `maya`.
-2. Send: `My preferred stack is Python, FastAPI and FalkorDB.`
-3. Click **New Session**.
-4. Ask: `What is my preferred stack?` and inspect the `semantic` source memory evidence.
-5. Ask: `What is our release process?` and inspect the procedural memory plus the persisted task/handoff timeline.
-6. Open **Agent Coordination** to see source coordinator, destination workflow specialist, handoff context, status, and result.
-7. Switch to `beta-demo` or user `leo`; `maya`'s personal memory is not returned.
-8. Open **Isolation & Concurrency** and run **Run Concurrent Memory Test**.
-9. Open **Graph View** and **System Health** to inspect live nodes, relationships, and counts.
+**Sidebar**
 
-The seed creates only synthetic records in the dedicated `acme-demo` workspace. Re-running is idempotent for fixed IDs; `--reset` clears only that exact demo graph before reseeding.
+- **Organization** — Acme or Beta (each is its own graph).
+- **Signed in as** — Maya or Leo (personal memory is per person).
+- **Pages** — Chat, Memory, Agents, Graph, Operations, Status.
 
-## Actual graph operations
+Use **Acme** and **Maya** unless a step says otherwise.
 
-All application Cypher is kept in named repository methods in `memory/graph_store.py`. Representative queries are also in `queries.cypher`. They include parameterized `MATCH`, `CREATE`, `MERGE`, `SET`, the explicit demo-only `DETACH DELETE` reset, relationship creation, filtered retrieval, status transitions, exact concurrent verification, and `SUPERSEDES` updates.
+### Pages
 
-## Tests and validation
+| Page | What it is for |
+|---|---|
+| **Chat** | Talk to the agents. New chat starts a new session; older sessions stay in the **Session** list. |
+| **Memory** | Search stored facts, or add a memory by type (episodic / semantic / procedural) and visibility (personal / shared). |
+| **Agents** | Tasks, handoffs, shared state, who answered, and the result. |
+| **Graph** | Live picture of nodes and relationships. |
+| **Operations** | Concurrent write/read check against the database. |
+| **Status** | Connection check and record counts. |
+
+Statements are stored. Questions are looked up in the graph and routed to an agent. After an answer, **Sources** shows the memory that was used; **How this was found** shows the graph path. **Activity** is recent turns (collapsed so Chat stays clean).
+
+### Manual usage / test flow
+
+Copy these into Chat. They are the main product checks.
+
+**1. Remember across sessions**
+
+1. Send: `My favorite food is Dosa.`
+2. Click **New chat** (this is a new session, like “session 5” after “session 12”).
+3. Ask: `What is my favorite food?`
+
+Expected: Dosa appears under **Sources**. This session’s transcript is only the new question and answer — the previous chat is not copied in. Switch **Session** in the dropdown to open the older chat if you want to see it.
+
+**2. Procedural memory**
+
+1. Send: `Our release process requires tests, QA approval and health verification.`
+2. **New chat**.
+3. Ask: `Which checks are required before release?`
+
+Expected: a procedural memory is used; the reply lists those checks.
+
+**3. Agent handoff**
+
+Ask: `Prepare a release checklist using our saved procedure.`
+
+Then open **Agents**. Expected:
+
+- Coordinator took the request
+- Procedural memory was retrieved
+- A task and a handoff exist
+- Destination is `workflow_specialist`
+- Status is completed and a result is stored
+
+**4. Isolation**
+
+Switch **Signed in as** to **Leo**, or **Organization** to **Beta**. Ask the food or stack question again.
+
+Expected: Maya’s personal facts are not returned.
+
+**5. Concurrency**
+
+Open **Operations** → **Run concurrency check**.
+
+Expected: 20 writes, 20 reads, 0 failures.
+
+**6. Graph**
+
+Open **Graph** after the steps above. You should see sessions, turns, memories, tasks, handoffs, and agents, all loaded from FalkorDB.
+
+**7. Database down**
+
+```bash
+docker stop recallmesh-db
+```
+
+Refresh the app. Expected: an error, and no “saved successfully” message. Then:
+
+```bash
+docker start recallmesh-db
+```
+
+Refresh again; Chat should work.
+
+### Automated tests
+
+These hit the real database. Keep FalkorDB running and the venv activated.
+
+**macOS / Linux**
 
 ```bash
 source .venv/bin/activate
 python -m pytest -q
+```
+
+**Windows**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pytest -q
+```
+
+All tests should pass (currently **22**). If the database is stopped, most tests fail on connection — that is expected.
+
+Optional extra check:
+
+```bash
 python -m compileall -q app.py memory agents tests scripts
 ```
 
-The suite covers connection-backed memory lifecycle, cross-session persistence, restart-like fresh clients, personal/shared/tenant isolation, fact supersession, agent task/handoff completion, concurrent writes and concurrent reads.
+---
 
-## Known limitations and security
+## Project layout
 
-- The demo user selector is logical isolation, not authentication or authorization.
-- The fallback classifier and response synthesis are deterministic; no LLM provider is required.
-- Production deployments still need network controls, secret management, TLS, authentication, rate limits, and a real identity provider.
-- The UI is a local hackathon interface, not a hardened multi-user service.
-- Concurrent verification is an application-level demonstration, not a benchmark or transactional workflow engine.
-- Graph visualization limits displayed nodes/edges for responsiveness, while sourcing every displayed item from FalkorDB.
+```text
+app.py                 UI
+agents/                Coordinator, Memory Agent, Workflow Specialist, routing
+memory/graph_store.py  All FalkorDB reads and writes
+scripts/seed_demo.py   Sample Acme data
+tests/                 pytest (needs FalkorDB running)
+queries.cypher         Example Cypher
+.env.example           Database settings
+```
+
+---
 
 ## Troubleshooting
 
-- **Unavailable**: check `docker ps`, `FALKORDB_HOST`, `FALKORDB_PORT`, and port `6379`.
-- **Existing container name**: run `docker start recallmesh-db`.
-- **Empty workspace**: run `python scripts/seed_demo.py --reset` and refresh Streamlit.
-- **No memory for another user**: expected for `personal`; use `shared` for tenant-wide knowledge.
-- **Failed test**: ensure FalkorDB is running and rerun `python -m pytest -q`.
+| Symptom | What to do |
+|---|---|
+| App says it cannot reach the database | `docker ps`. Start with `docker start recallmesh-db` or the `docker run` command above. Confirm port **6379**. |
+| `docker run` says the name is taken | `docker start recallmesh-db` |
+| Empty Acme workspace | `python scripts/seed_demo.py --reset` then refresh the browser |
+| Another user cannot see a fact | Personal memory is per user. Use **shared** visibility for org-wide facts |
+| Tests fail | Start FalkorDB, activate `.venv`, run `python -m pytest -q` again |
+| `streamlit` not found | The venv is not active, or `pip install -r requirements.txt` was skipped |
 
-## Disclosure
+To stop the database:
 
-AI coding assistants were used during implementation and validation. Claims in this document are based on the checked-in code and commands actually run.
+```bash
+docker stop recallmesh-db
+```
 
-## Final verification checklist
+The app should show a connection error and must not claim it saved anything. Start it again with `docker start recallmesh-db`.
 
-- [x] FalkorDB is the persistent source of truth.
-- [x] Tenant graphs and user-scoped personal memory are enforced.
-- [x] Cross-session and fresh-client persistence are tested.
-- [x] Memory updates preserve history with `SUPERSEDES`.
-- [x] Real coordinator handoffs and status/result persistence are tested.
-- [x] Concurrent writes and reads are verified with UUID records.
-- [x] Six judge-facing UI views exist.
-- [x] Synthetic demo seed is repeatable and reset-scoped.
-- [x] Startup, test, troubleshooting, limitations, and recording guidance are documented.
+---
 
-## 2–3 minute demo recording plan
+## Configuration
 
-1. **0:00–0:20** — Show `acme-demo`, `maya`, FalkorDB connected, and explain graph-per-tenant isolation.
-2. **0:20–0:55** — Save the preferred-stack sentence, click **New Session**, ask the question, and point to the semantic FalkorDB source memory.
-3. **0:55–1:30** — Ask the release-process question; show coordinator → workflow specialist, memory references, completed status, result, and persisted timeline.
-4. **1:30–1:55** — Switch to `beta-demo` and `leo`; show the personal memory is absent, then return to `acme-demo`/`maya`.
-5. **1:55–2:20** — Run the concurrent memory test and show attempted, successful, failed, and verification counts.
-6. **2:20–2:45** — Show Graph View and System Health, then mention the tests and deterministic no-key fallback.
+| Variable | Default | Meaning |
+|---|---|---|
+| `FALKORDB_HOST` | `localhost` | Database host |
+| `FALKORDB_PORT` | `6379` | Database port |
+| `FALKORDB_USERNAME` | empty | Optional |
+| `FALKORDB_PASSWORD` | empty | Optional |
+| `FALKORDB_GRAPH_PREFIX` | `recallmesh` | Graph names become `prefix_organization` |
+
+---
+
+## Limits
+
+- The person picker is a demo switch, not real login.
+- Extraction is pattern-based (for example `my … is …`, release process). Free-form chat still stores as episodic when it is a statement.
+- Concurrency check is a correctness demo, not a load benchmark.
+- Graph view caps how many nodes it draws; every item still comes from FalkorDB.
+
+---
+
+## License / origin
+
+Built as an open project on FalkorDB. AI coding tools were used while writing and checking the code. Behavior described here matches the repository as it stands.

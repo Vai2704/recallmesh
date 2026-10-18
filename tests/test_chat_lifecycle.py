@@ -42,6 +42,52 @@ def test_procedural_memory_is_retrieved(store):
     assert any(item["memory_type"] == "procedural" for item in result.retrieved_memories)
 
 
+def test_prior_session_turns_are_recalled_without_memory_nodes(store):
+    tenant = f"turns_{uuid.uuid4().hex[:10]}"
+    user = "alice"
+    store.create_session(tenant, "old", user)
+    store.save_turn(tenant, "old", "t1", "user", "Hi my name is vaibhav. How are you", "user")
+    hits = store.retrieve_relevant_memory(tenant, user, "what is my name")
+    assert hits
+    assert "vaibhav" in hits[0]["content"].lower()
+
+
+def test_latest_name_is_preferred_over_older_turns(store):
+    tenant = f"latest_{uuid.uuid4().hex[:10]}"
+    user = "alice"
+    agent = DeterministicChatAgent(store)
+    agent.handle(tenant, user, f"session_{uuid.uuid4().hex[:10]}", "Hi my name is vaibhav. How are you")
+    agent.handle(tenant, user, f"session_{uuid.uuid4().hex[:10]}", "Hi my name is Sania gupta")
+    asked = agent.handle(tenant, user, f"session_{uuid.uuid4().hex[:10]}", "what is my name")
+    assert len(asked.retrieved_memories) == 1
+    assert "sania" in asked.retrieved_memories[0]["content"].lower()
+    assert "vaibhav" not in asked.retrieved_memories[0]["content"].lower()
+
+
+def test_name_is_recalled_from_older_session_turns(store):
+    tenant = f"name_{uuid.uuid4().hex[:10]}"
+    user = "alice"
+    agent = DeterministicChatAgent(store)
+    first = agent.handle(tenant, user, f"session_{uuid.uuid4().hex[:10]}", "Hi my name is vaibhav. How are you")
+    assert first.saved_memory
+    asked = agent.handle(tenant, user, f"session_{uuid.uuid4().hex[:10]}", "what is my name")
+    assert asked.retrieved_memories
+    assert "vaibhav" in asked.response.lower()
+
+
+def test_explain_memory_includes_supersedes_path(store):
+    tenant = f"path_{uuid.uuid4().hex[:10]}"
+    store.create_memory(tenant, "old_name", "alice", "personal", "semantic", "My name is vaibhav.", 1.0, "name")
+    store.supersede_memory(tenant, "old_name", "new_name", "alice", "personal", "semantic", "My name is Sania gupta.", 1.0, "name")
+    store.create_session(tenant, "sess_path", "alice")
+    store.attach_memory_to_session(tenant, "sess_path", "new_name")
+    path = store.explain_memory(tenant, "new_name")
+    hops = " ".join(path["hops"])
+    assert "SUPERSEDES" in hops
+    assert "old_name" in hops
+    assert "HAS_MEMORY" in hops
+
+
 def test_chat_fact_change_supersedes_old_memory(store):
     tenant = f"change_{uuid.uuid4().hex[:10]}"
     agent = DeterministicChatAgent(store)

@@ -35,5 +35,18 @@ CREATE (e:CoordinationEvent {event_id:$event_id, stage:$stage,
   status:$status, detail:$detail, at:$now})
 CREATE (t)-[:HAS_EVENT]->(e);
 
+MERGE (s:SharedState {state_id:$state_id})
+SET s.user_id=$user_id, s.key=$key, s.value=$value, s.updated_by=$agent_id;
+MATCH (t:Task {task_id:$task_id})-[:USES_MEMORY]->(m:Memory)
+WHERE m.active=true
+RETURN m.memory_type AS memory_type, m.content AS content;
+
+MATCH (m:Memory {memory_id:$memory_id})
+OPTIONAL MATCH (m)-[:SUPERSEDES]->(old:Memory)
+OPTIONAL MATCH (s:Session)-[:HAS_MEMORY]->(m)
+OPTIONAL MATCH (t:Task)-[:USES_MEMORY]->(m)
+RETURN m.memory_id AS memory_id, collect(DISTINCT old.memory_id) AS superseded_ids,
+  collect(DISTINCT s.session_id) AS session_ids, collect(DISTINCT t.task_id) AS task_ids;
+
 // Synthetic demo-only reset, never used for arbitrary tenant input.
 MATCH (n) DETACH DELETE n;

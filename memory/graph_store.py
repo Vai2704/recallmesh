@@ -7,6 +7,16 @@ from falkordb import FalkorDB
 from .schema import MEMORY_SCOPES, MEMORY_TYPES, Settings, schema_queries
 
 SAFE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,48}$")
+RETRIEVAL_STOPWORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "your", "our", "was",
+    "what", "who", "when", "where", "why", "how", "did", "does", "can",
+    "could", "would", "should", "please", "tell", "about", "this", "that",
+    "with", "from", "have", "has", "had", "will", "just", "also", "any",
+}
+QUESTION_PREFIX = re.compile(
+    r"^(what|who|when|where|why|how|do|does|did|can|could|would|should|tell|please)\b",
+    re.I,
+)
 
 def validate_tenant_id(tenant_id: str) -> str:
     if not isinstance(tenant_id, str) or not SAFE_ID.fullmatch(tenant_id):
@@ -49,8 +59,25 @@ class GraphStore:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def tokens(text: str) -> set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-z0-9]+", str(text or "").lower())
+            if len(term) > 2 and term not in RETRIEVAL_STOPWORDS
+        }
+
+    @staticmethod
+    def is_question(text: str) -> bool:
+        stripped = str(text or "").strip()
+        return stripped.endswith("?") or bool(QUESTION_PREFIX.match(stripped))
+
     def create_session(self, tenant_id, session_id, user_id, created_at=None):
-        return self.rows(self.query(tenant_id, "MERGE (s:Session {session_id:$session_id}) SET s.user_id=$user_id, s.created_at=$created_at RETURN s", {"session_id": session_id, "user_id": user_id, "created_at": created_at or self._now()}))
+        query = """MERGE (s:Session {session_id:$session_id})
+        ON CREATE SET s.user_id=$user_id, s.created_at=$created_at
+        ON MATCH SET s.user_id=coalesce(s.user_id, $user_id)
+        RETURN s.session_id AS session_id, s.user_id AS user_id, s.created_at AS created_at"""
+        return self.rows(self.query(tenant_id, query, {"session_id": session_id, "user_id": user_id, "created_at": created_at or self._now()}))
 
     def get_session(self, tenant_id, session_id, user_id=None):
         query = "MATCH (s:Session {session_id:$session_id}) WHERE $user_id IS NULL OR s.user_id=$user_id RETURN s"
@@ -66,7 +93,7 @@ class GraphStore:
         return self.rows(self.query(tenant_id, query, {"session_id": session_id, "turn_id": turn_id, "role": role, "content": content, "agent_id": agent_id, "timestamp": timestamp or self._now()}))
 
     def get_turns(self, tenant_id, session_id):
-        return self.rows(self.query(tenant_id, "MATCH (:Session {session_id:$session_id})-[:HAS_TURN]->(t:Turn) RETURN t ORDER BY t.timestamp", {"session_id": session_id}))
+        return self.rows(self.query(tenant_id, "MATCH (:Session {session_id:$session_id})-[:HAS_TURN]->(t:Turn) RETURN t.turn_id AS turn_id, t.role AS role, t.content AS content, t.timestamp AS timestamp, t.agent_id AS agent_id ORDER BY t.timestamp", {"session_id": session_id}))
 
     def create_memory(self, tenant_id, memory_id, user_id, scope, memory_type, content, confidence=1.0, fact_key=None):
         if scope not in MEMORY_SCOPES or memory_type not in MEMORY_TYPES:
@@ -80,17 +107,82 @@ class GraphStore:
         m.active AS active, m.version AS version, m.fact_key AS fact_key"""
         return self.rows(self.query(tenant_id, query, {"memory_id": memory_id, "user_id": user_id, "scope": scope, "memory_type": memory_type, "content": content, "confidence": confidence, "fact_key": fact_key, "now": now}))
 
-    def retrieve_relevant_memory(self, tenant_id, user_id, text, limit=10):
+    def _score_candidates(self, candidates, text, excluded):
+        terms = self.tokens(text)
+        scored, seen = [], set()
+        for item in candidates:
+            content = str(item.get("content") or "")
+            key = content.strip().lower()
+            if not key or key in excluded or key in seen:
+                continue
+            seen.add(key)
+            item["relevance"] = len(terms & self.tokens(content))
+            fact_key = str(item.get("fact_key") or "")
+            if fact_key and any(term in fact_key.replace("_", " ").split() for term in terms):
+                item["relevance"] += 1
+            if item["relevance"] > 0:
+                scored.append(item)
+        return scored
+
+    def _latest_facts(self, items):
+        """Keep the newest Memory for each fact_key; drop older restatements of the same fact."""
+        ranked = sorted(
+            items,
+            key=lambda item: (item.get("updated_at") or "", item.get("version") or 0, item.get("confidence") or 0),
+            reverse=True,
+        )
+        by_fact, leftover = {}, []
+        for item in ranked:
+            fact_key = item.get("fact_key")
+            if fact_key:
+                by_fact.setdefault(fact_key, item)
+            else:
+                leftover.append(item)
+        facts = list(by_fact.values())
+        covered = set()
+        for item in facts:
+            covered |= self.tokens(item.get("content", ""))
+            covered |= self.tokens(str(item.get("fact_key") or "").replace("_", " "))
+        unique = facts[:]
+        for item in leftover:
+            if self.tokens(item.get("content", "")) & covered:
+                continue
+            unique.append(item)
+        return sorted(unique, key=lambda item: (item["relevance"], item.get("confidence") or 0, item.get("updated_at") or ""), reverse=True)
+
+    def retrieve_relevant_memory(self, tenant_id, user_id, text, limit=10, exclude_contents=None):
         query = """MATCH (m:Memory) WHERE m.active=true AND (m.scope='shared' OR m.user_id=$user_id)
         RETURN m.memory_id AS memory_id, m.user_id AS user_id, m.scope AS scope,
         m.memory_type AS memory_type, m.content AS content, m.confidence AS confidence,
         m.version AS version, m.updated_at AS updated_at, m.fact_key AS fact_key"""
-        candidates = self.rows(self.query(tenant_id, query, {"user_id": user_id}))
-        terms = {term for term in re.findall(r"[a-z0-9]+", text.lower()) if len(term) > 2}
-        for item in candidates:
-            words = set(re.findall(r"[a-z0-9]+", str(item.get("content", "")).lower()))
-            item["relevance"] = len(terms & words)
-        return sorted((item for item in candidates if item["relevance"] > 0), key=lambda item: (item["relevance"], item.get("confidence") or 0, item.get("updated_at") or ""), reverse=True)[:limit]
+        memories = self.rows(self.query(tenant_id, query, {"user_id": user_id}))
+        for item in memories:
+            item["source"] = "memory"
+        excluded = {str(item).strip().lower() for item in (exclude_contents or []) if item}
+        if not self.tokens(text):
+            return []
+        memory_hits = self._latest_facts(self._score_candidates(memories, text, excluded))
+        if memory_hits:
+            return memory_hits[:limit]
+        turns = []
+        for turn in self.get_recent_turns(tenant_id, user_id, 50):
+            content = str(turn.get("content") or "")
+            if turn.get("role") != "user" or self.is_question(content) or content.strip().lower() in excluded:
+                continue
+            turns.append({
+                "memory_id": turn["turn_id"],
+                "user_id": user_id,
+                "scope": "personal",
+                "memory_type": "episodic",
+                "content": content,
+                "confidence": 0.7,
+                "version": 1,
+                "updated_at": turn.get("timestamp"),
+                "fact_key": None,
+                "source": "turn",
+            })
+        turn_hits = self._score_candidates(turns, text, excluded)
+        return sorted(turn_hits, key=lambda item: (item["relevance"], item.get("updated_at") or ""), reverse=True)[:1]
 
     def retrieve_shared_memory(self, tenant_id, user_id, memory_type=None, limit=50):
         query = """MATCH (m:Memory) WHERE m.active=true AND m.scope='shared'
@@ -153,10 +245,72 @@ class GraphStore:
         return self.rows(self.query(tenant_id, query, {"task_id": task_id, "event_id": f"event_{uuid.uuid4().hex[:12]}", "stage": stage, "status": status, "detail": detail, "result": result, "at": self._now()}))
 
     def attach_memory_to_session(self, tenant_id, session_id, memory_id):
-        return self.rows(self.query(tenant_id, "MATCH (s:Session {session_id:$session_id}), (m:Memory {memory_id:$memory_id}) CREATE (s)-[:HAS_MEMORY]->(m) RETURN m", {"session_id": session_id, "memory_id": memory_id}))
+        return self.rows(self.query(tenant_id, "MATCH (s:Session {session_id:$session_id}), (m:Memory {memory_id:$memory_id}) MERGE (s)-[:HAS_MEMORY]->(m) RETURN m.memory_id AS memory_id", {"session_id": session_id, "memory_id": memory_id}))
 
     def attach_memory_to_task(self, tenant_id, task_id, memory_id):
-        return self.rows(self.query(tenant_id, "MATCH (t:Task {task_id:$task_id}), (m:Memory {memory_id:$memory_id}) CREATE (t)-[:USES_MEMORY]->(m) RETURN m", {"task_id": task_id, "memory_id": memory_id}))
+        return self.rows(self.query(tenant_id, "MATCH (t:Task {task_id:$task_id}), (m:Memory {memory_id:$memory_id}) MERGE (t)-[:USES_MEMORY]->(m) RETURN m.memory_id AS memory_id", {"task_id": task_id, "memory_id": memory_id}))
+
+    def explain_memory(self, tenant_id, memory_id) -> dict[str, Any]:
+        """Return the graph neighborhood that justifies using this memory."""
+        rows = self.rows(self.query(tenant_id, """
+        MATCH (m:Memory {memory_id:$memory_id})
+        OPTIONAL MATCH (m)-[:SUPERSEDES]->(old:Memory)
+        OPTIONAL MATCH (s:Session)-[:HAS_MEMORY]->(m)
+        OPTIONAL MATCH (t:Task)-[:USES_MEMORY]->(m)
+        RETURN m.memory_id AS memory_id, m.memory_type AS memory_type, m.content AS content,
+        m.version AS version, m.active AS active, m.fact_key AS fact_key, m.scope AS scope,
+        collect(DISTINCT old.memory_id) AS superseded_ids,
+        collect(DISTINCT s.session_id) AS session_ids,
+        collect(DISTINCT t.task_id) AS task_ids
+        """, {"memory_id": memory_id}))
+        if not rows:
+            return {"memory_id": memory_id, "hops": [], "summary": "Memory node not found"}
+        row = rows[0]
+        hops = [f"Memory `{row['memory_id']}` type={row['memory_type']} v{row['version']} scope={row['scope']}"]
+        for session_id in (item for item in row.get("session_ids") or [] if item):
+            hops.append(f"(Session `{session_id}`)-[:HAS_MEMORY]->(Memory `{row['memory_id']}`)")
+        for task_id in (item for item in row.get("task_ids") or [] if item):
+            hops.append(f"(Task `{task_id}`)-[:USES_MEMORY]->(Memory `{row['memory_id']}`)")
+        for old_id in (item for item in row.get("superseded_ids") or [] if item):
+            hops.append(f"(Memory `{row['memory_id']}`)-[:SUPERSEDES]->(Memory `{old_id}`)")
+        row["hops"] = hops
+        row["summary"] = " → ".join(hops[:4])
+        return row
+
+    def explain_task(self, tenant_id, task_id) -> list[dict[str, Any]]:
+        memories = self.get_task_memories(tenant_id, task_id)
+        return [self.explain_memory(tenant_id, item["memory_id"]) for item in memories if item.get("memory_id")]
+
+    def get_task_memories(self, tenant_id, task_id):
+        query = """MATCH (t:Task {task_id:$task_id})-[:USES_MEMORY]->(m:Memory)
+        WHERE m.active=true
+        RETURN m.memory_id AS memory_id, m.user_id AS user_id, m.scope AS scope,
+        m.memory_type AS memory_type, m.content AS content, m.confidence AS confidence,
+        m.fact_key AS fact_key"""
+        return self.rows(self.query(tenant_id, query, {"task_id": task_id}))
+
+    def upsert_shared_state(self, tenant_id, user_id, key, value, agent_id, task_id=None):
+        state_id = f"{user_id}:{key}"
+        rows = self.rows(self.query(tenant_id, """MERGE (s:SharedState {state_id:$state_id})
+        SET s.user_id=$user_id, s.key=$key, s.value=$value, s.updated_by=$agent_id,
+        s.updated_at=$now, s.task_id=$task_id
+        RETURN s.state_id AS state_id, s.user_id AS user_id, s.key AS key, s.value AS value,
+        s.updated_by AS updated_by, s.updated_at AS updated_at""", {
+            "state_id": state_id, "user_id": user_id, "key": key, "value": value,
+            "agent_id": agent_id, "task_id": task_id, "now": self._now(),
+        }))
+        if task_id:
+            self.query(tenant_id, """MATCH (t:Task {task_id:$task_id}), (s:SharedState {state_id:$state_id})
+            MERGE (t)-[:USES_STATE]->(s)""", {"task_id": task_id, "state_id": state_id})
+        return rows
+
+    def get_shared_state(self, tenant_id, user_id, key=None):
+        query = """MATCH (s:SharedState {user_id:$user_id})
+        WHERE $key IS NULL OR s.key=$key
+        RETURN s.state_id AS state_id, s.user_id AS user_id, s.key AS key, s.value AS value,
+        s.updated_by AS updated_by, s.updated_at AS updated_at, s.task_id AS task_id
+        ORDER BY s.updated_at DESC"""
+        return self.rows(self.query(tenant_id, query, {"user_id": user_id, "key": key}))
 
     def list_graph_records(self, tenant_id):
         return self.rows(self.query(tenant_id, "MATCH (n) RETURN labels(n) AS labels, properties(n) AS properties ORDER BY labels(n)[0]"))
@@ -185,7 +339,7 @@ class GraphStore:
 
     def record_counts(self, tenant_id):
         counts = {}
-        for label in ("Session", "Turn", "Memory", "Agent", "Task", "Handoff", "CoordinationEvent"):
+        for label in ("Session", "Turn", "Memory", "SharedState", "Agent", "Task", "Handoff", "CoordinationEvent"):
             result = self.query(tenant_id, f"MATCH (n:{label}) RETURN count(n) AS count")
             counts[label] = self.rows(result)[0]["count"]
         relationship_result = self.query(tenant_id, "MATCH ()-[r]->() RETURN count(r) AS count")
@@ -198,7 +352,9 @@ class GraphStore:
 
         def write(record):
             memory_id, content = record
-            return self.create_memory(tenant_id, memory_id, user_id, "personal", "episodic", content, 1.0)
+            created = self.create_memory(tenant_id, memory_id, user_id, "personal", "episodic", content, 1.0)
+            self.upsert_shared_state(tenant_id, user_id, memory_id, content, "concurrency_test")
+            return created
 
         successful_writes, failures = [], []
         with ThreadPoolExecutor(max_workers=workers) as executor:

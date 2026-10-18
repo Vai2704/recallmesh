@@ -17,6 +17,7 @@ def schema_queries() -> tuple[str, ...]:
     return tuple(f"CREATE INDEX FOR (n:{label}) ON (n.{property_name})" for label, property_name in (
         ("Session", "session_id"), ("Turn", "turn_id"), ("Memory", "memory_id"),
         ("Agent", "agent_id"), ("Task", "task_id"), ("Handoff", "handoff_id"),
+        ("SharedState", "state_id"), ("SharedState", "user_id"),
     ))
 
 MEMORY_TYPES = {"episodic", "semantic", "procedural"}

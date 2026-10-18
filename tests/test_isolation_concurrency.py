@@ -26,6 +26,15 @@ def test_tenant_and_personal_memory_isolation(store):
     assert store.list_sessions(tenant_b, "maya") == []
 
 
+def test_shared_state_is_isolated_by_user_and_tenant(store):
+    tenant_a = f"state_{uuid.uuid4().hex[:10]}"
+    tenant_b = f"state_{uuid.uuid4().hex[:10]}"
+    store.upsert_shared_state(tenant_a, "maya", "working_context", "maya context", "coordinator")
+    assert store.get_shared_state(tenant_a, "maya")
+    assert store.get_shared_state(tenant_a, "leo") == []
+    assert store.get_shared_state(tenant_b, "maya") == []
+
+
 def test_concurrent_writes_and_reads_are_verified(store):
     tenant = f"concurrent_{uuid.uuid4().hex[:10]}"
     result = store.run_concurrent_memory_test(tenant, "maya", count=20, workers=5)
